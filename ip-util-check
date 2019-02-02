@@ -1,44 +1,55 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-export DOCKER_CERT_PATH
-export DOCKER_HOST
-export DOCKER_TLS_VERIFY
+# export DOCKER_CERT_PATH
+# export DOCKER_HOST
+# export DOCKER_TLS_VERIFY
 
 set -e
 
 # Per-network state keyed on network ID
 #
-declare -A NET2SUB	  # list of subnets for each overlay network
-declare -A NET2CAP	  # network capacity of each overlay network
-declare -A NET2NAME	  # network name of each overlay network
-declare -A NET2NCIP	  # number of container IP addresses for each overlay network
-declare -A NET2NVIP	  # number of virtual IP addresses for each overlay network
-declare -A NET2NNODES # number of nodes where the overlay is currently used
+declare -A NET2SUB        # list of subnets for each overlay network
+declare -A NET2CAP        # network capacity of each overlay network
+declare -A NET2NAME       # network name of each overlay network
+declare -A NET2NCIP       # number of container IP addresses for each overlay network
+declare -A NET2NVIP       # number of virtual IP addresses for each overlay network
+declare -A NET2NNODES     # number of nodes where the overlay is currently used or if not available forfait to a 25% of the cluster
+declare -A NODESESTIMATED # indicates if the number of nodes per network is estimated to 25% of the cluster or is messured
 
+debugme() {
+ [[ $DEBUG = 1 ]] && "$@" || :
+ # be sure to append || : or || true here or use return 0, since the return code
+ # of this function should always be 0 to not influence anything else with an unwanted
+ # "false" return code (for example the script's exit code if this function is used
+ # as the very last command in the script)
+}
 
 # Report the general IP utilization status of an overlay network
 # Args:
 #  - $1 - network ID to report on
 report() {
-	echo "----"
-	if [ "${NET2CAP[$1]}" -eq 0 ] ; then
-		echo "Network ${NET2NAME[$1]}/$1 has no assigned IP addresses"
-		echo "	Network OK"
-	else
-		USE=$(( ${NET2NCIP[$1]} + ${NET2NVIP[$1]} ))            # how many IPs are currently in use
-		SAFECAP=$(( ${NET2CAP[$1]} * 75 / 100 ))                # safe capacity is the 75% of the whole address space
+  echo "----"
+  if [ "${NET2CAP[$1]}" -eq 0 ] ; then
+    echo "Network ${NET2NAME[$1]}/$1 has no assigned IP addresses"
+    echo "  Network OK"
+  else
+    USE=$(( ${NET2NCIP[$1]} + ${NET2NVIP[$1]} ))            # how many IPs are currently in use
+    SAFECAP=$(( ${NET2CAP[$1]} * 75 / 100 ))                # safe capacity is the 75% of the whole address space
     HDRM=$(( ${NET2CAP[$1]} - $USE - ${NET2NNODES[$1]}))    # how many IPs are currently free in the network
-		echo "Network ${NET2NAME[$1]}/$1 has an IP address capacity of ${NET2CAP[$1]} and uses $USE addresses spanning over ${NET2NNODES[$1]} nodes"
-
-		if [ $(( $USE + ${NET2NNODES[$1]} )) -ge ${NET2CAP[$1]} ] ; then
-			echo "	ERROR: network will be over capacity if upgrading Docker Enterprise engine version 18.09 or later"
-		elif [ $(( $USE + ${NET2NNODES[$1]} )) -ge $SAFECAP ] ; then
-			echo -n "	WARNING: network is using more than the 75% of the total space. "
+    if [ ${NODESESTIMATED[$1]} -eq 1 ]; then
+      echo "Network ${NET2NAME[$1]}/$1 has an IP address capacity of ${NET2CAP[$1]} and uses approximately $USE addresses"
+    else
+      echo "Network ${NET2NAME[$1]}/$1 has an IP address capacity of ${NET2CAP[$1]} and uses $USE addresses spanning over ${NET2NNODES[$1]} nodes"
+    fi
+    if [ $(( $USE + ${NET2NNODES[$1]} )) -ge ${NET2CAP[$1]} ] ; then
+      echo "  ERROR: network will be over capacity if upgrading Docker Enterprise engine version 18.09 or later"
+    elif [ $(( $USE + ${NET2NNODES[$1]} )) -ge $SAFECAP ] ; then
+      echo -n " WARNING: network is using more than the 75% of the total space. "
       echo "Remaining only $HDRM IPs after upgrade"
-		else
-      echo "	Network OK: network will have $(( $SAFECAP - $USE - ${NET2NNODES[$1]} )) available IPs before passing the 75% subnet use"
-		fi
-	fi
+    else
+      echo "  Network OK: network will have $(( $SAFECAP - $USE - ${NET2NNODES[$1]} )) available IPs before passing the 75% subnet use"
+    fi
+  fi
 }
 
 
@@ -51,52 +62,65 @@ SVCIDS=$(docker service ls -q)
 
 
 echo "Gathering overlay network information"
+debugme set -x
 for net in $NETS ; do
   networkInspect=$( docker network inspect $net )
         NET2NAME[$net]=$(echo $networkInspect | jq -r '.[].Name')
-	set +e
+  set +e
         NET2SUB[$net]=$(echo $networkInspect | jq -r '.[].IPAM.Config[].Subnet' 2>/dev/null)
+
 	if [ -z "${NET2SUB[$net]}" ] ; then
-		NET2SUB[$net]=$(docker network inspect ${NET2NAME[$net]} | jq -r '.[].IPAM.Config[].Subnet' 2>/dev/null)
+		NET2SUB[$net]=$(/usr/bin/swarmctl network inspect ${NET2NAME[$net]} | grep Subnet | awk -F ": " '{print $2}' 2>/dev/null)
 	fi
 	set -e
         NET2CAP[$net]=0
         NET2NCIP[$net]=0
         NET2NVIP[$net]=0
         NET2NNODES[$net]=$( echo $networkInspect | jq -r '.[].Peers | length' )
+        if [ ${NET2NNODES[$net]} -eq 0 ]; then
+          # value has to be esitmated
+          NODESESTIMATED[$net]=1
+          NET2NNODES[$net]=$((${#NNODES[@]}*25/100))
+          # avoid non zero result for small clusters
+          if [ ${NET2NNODES[$net]} -eq 0 ]; then NET2NNODES[$net]=1; fi
+        else
+          NODESESTIMATED[$net]=0
+        fi
         for sub in ${NET2SUB[$net]} ; do
                 pfxlen=$(echo $sub | awk -F / '{print $2}')
                 subcap=$(( (1 << (32 - $pfxlen)) - 3 ))
                 NET2CAP[$net]=$(( ${NET2CAP[$net]} + $subcap ))
         done
 done
-
+debugme set +x
 
 echo "Counting container IP allocations per network"
+debugme set -x
 for node in $NODEIDS ; do
-	for task in $(docker node ps -f 'desired-state = running' -q $node) ; do
-		nets=$(docker inspect $task | jq -r '.[].Spec.Networks[].Target' 2>/dev/null | cut -c 1-12)
-		for net in $nets; do
-			NET2NCIP[$net]=$((${NET2NCIP[$net]} + 1))
-		done
-	done
+  for task in $(docker node ps -f 'desired-state = running' -q $node) ; do
+    nets=$(docker inspect $task | jq -r '.[].Spec.Networks[].Target' 2>/dev/null | cut -c 1-12)
+    for net in $nets; do
+      NET2NCIP[$net]=$((${NET2NCIP[$net]} + 1))
+    done
+  done
 done
+debugme set +x
 
 
 echo "Counting service VIP allocations per network"
+debugme set -x
 for svc in $SVCIDS ; do
-	for viprec in $(docker service inspect $svc | jq -rc '.[].Endpoint.VirtualIPs[]' 2>/dev/null); do
-		net=$(echo "$viprec" | jq -r '.NetworkID' | cut -c 1-12)
-		addr=$(echo "$viprec" | jq -r '.Addr')
-		NET2NVIP[$net]=$((${NET2NVIP[$net]} + 1))
-	done
+  for viprec in $(docker service inspect $svc | jq -rc '.[].Endpoint.VirtualIPs[]' 2>/dev/null); do
+    net=$(echo "$viprec" | jq -r '.NetworkID' | cut -c 1-12)
+    addr=$(echo "$viprec" | jq -r '.Addr')
+    NET2NVIP[$net]=$((${NET2NVIP[$net]} + 1))
+  done
 done
-
+debugme set +x
 
 # Report the IP utilization for each overlay network
 echo ""
 echo "Overlay IP Utilization Report"
 for net in $NETS ; do
-	report $net
+  report $net
 done
-

@@ -20,14 +20,29 @@ The script flags several potential conditions for each overlay:
     cluster size scales up to a certain number of nodes
   * IP address space is allocated to > 80% capacity
 
+####  Note: 
+Under certain conditions, it may not be possible to accurately
+count the number of IP addresses on a network due to Docker's
+networking state distribution architecture.
+
+Gossip protocol only distributes network programming to nodes that 
+participate in an overlay network.  A node must have a container or 
+service task scheduled on it attached to an overlay network to be 
+considered an overlay network peer.  Manager nodes that are not running
+workloads may not be able to accurately count the number of IP addresses
+on overlay networks scheduled on worker nodes.  In this case, we approximate.
 
 Building the Container
 ======================
-docker image build -t docker/ip-util-check .
-
+```
+docker build -t docker/ip-util-check .
+```
 
 Running the Container
 =====================
-
-    docker run -it --rm -v /var/run/docker.sock:/var/run/docker.sock \
-            docker/ip-util-check
+```
+docker run -it --rm \
+ -v /var/run/docker.sock:/var/run/docker.sock \
+ -v /var/run/docker/swarm/control.sock:/var/run/swarmd.sock \
+ docker/ip-util-check
+```
